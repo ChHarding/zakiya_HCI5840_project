@@ -16,7 +16,7 @@ OUTPUT_HTML = "output.html"
 # Fetch JSON from ESPN's play-by-play endpoint
 def fetch_game_data(game_id):
     url = (
-        f"http://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
+        f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
         f"summary?event={game_id}"
     )
     try:
@@ -71,7 +71,7 @@ def elapsed_time(period, clock_str):
     if period <= 4:
         total_seconds = (period - 1) * 720
     else:
-        total_seconds = (4 * 720) + ((period - 4) * 300)
+        total_seconds = (4 * 720) + ((period - 5) * 300)
 
     total_seconds += (720 if period <= 4 else 300) - clock_to_seconds(clock_str)
 
@@ -99,10 +99,12 @@ def parse_plays(plays, team_map):
         # Resolve which team made this play
         team_id = str(play.get("team", {}).get("id", ""))
         team_name = team_map.get(team_id, team_id or "Unknown")
+        p_num = play.get("period", {}).get("number", None)
+        clock = play.get("clock", {}).get("displayValue", "")
 
         row = {
-            "period":       play.get("period", {}).get("number", None),
-            "clock":        play.get("clock", {}).get("displayValue", ""),
+            "period":       p_num,
+            "clock":        clock,
             "team":         team_name,
             "type":         play.get("type", {}).get("text", ""),
             "text":         play.get("text", ""),
@@ -110,8 +112,9 @@ def parse_plays(plays, team_map):
             "homeScore":    play.get("homeScore", None),
             "awayScore":    play.get("awayScore", None),
             "scoringPlay":  play.get("scoringPlay", False),
-            "periodLabel":  period_label(play.get("period", {}).get("number", None)),
-            "elapsedTime":  elapsed_time(play.get("period", {}).get("number", 0), play.get("clock", {}).get("displayValue", "")),
+            "periodLabel":  period_label(p_num),
+            "elapsedTime":  elapsed_time(p_num or 0, clock),
+            "timeLabel":   f"{period_label(p_num)} {clock}" .strip(),
         }
         rows.append(row)
 
@@ -129,6 +132,7 @@ def compute_momentum(df):
 
     df["momentum"] = df["homeScore"] - df["awayScore"]
     df["swing"]    = df["momentum"].diff().abs()
+    df["gameMinutes"] = df["elapsedTime"] / 60.0
     df = df.reset_index(drop=True)
 
     return df
@@ -145,6 +149,29 @@ def find_top_swings(df, n=5):
     top = scoring.nlargest(n, "swing")
     return top
 
+# Quarter / OT divider lines along the game-minute scale
+def add_period_markers(fig, max_minutes):
+
+    boundaries = [12, 24, 36]
+    labels = [("Q1", 6), ("Q2", 18), ("Q3", 30), ("Q4", 42)]
+
+    # Extend markers if the game went to OT (each OT = 5 min)
+    ot_num = 1
+    ot_start = 48
+    while max_minutes > ot_start:
+        boundaries.append(ot_start)
+        labels.append((f"OT{ot_num}", ot_start + 2.5))
+        ot_start += 5
+        ot_num += 1
+
+    for boundary in boundaries:
+        fig.add_vline(x=boundary, line_dash="dot",
+                      line_color="rgba(0,0,0,0.18)", line_width=1)
+    for label, x_pos in labels:
+        fig.add_annotation(x=x_pos, y=1, yref="paper", text=label,
+                           showarrow=False,
+                           font=dict(size=11, color="rgba(0,0,0,0.45)"))
+
 # Plotly graph
 def plot_momentum(df, top_swings, home_name="Home", away_name="Away"):
 
@@ -152,18 +179,17 @@ def plot_momentum(df, top_swings, home_name="Home", away_name="Away"):
 
     # --- Main momentum line ---
     fig.add_trace(go.Scatter(
-        x=df.index,
+        x=df["gameMinutes"],
         y=df["momentum"],
         mode="lines",
         name="Score differential",
         line=dict(color="#1d428a", width=2),   # NBA blue
         hovertemplate=(
-            "Play %{x}<br>"
+            "%{customdata[0]}<br>"
             "Differential: %{y}<br>"
-            "%{customdata[0]} %{customdata[1]}<br>"
-            "%{customdata[2]}<extra></extra>"
+            "%{customdata[1]}<extra></extra>"
         ),
-        customdata=df[["periodLabel", "elapsedTime", "text"]],
+        customdata=df[["timeLabel", "text"]],
     ))
 
     # --- Horizontal zero line (tied game) ---
@@ -178,7 +204,7 @@ def plot_momentum(df, top_swings, home_name="Home", away_name="Away"):
     # --- Top-swing markers ---
     if not top_swings.empty:
         fig.add_trace(go.Scatter(
-            x=top_swings.index,
+            x=top_swings["gameMinutes"],
             y=top_swings["momentum"],
             mode="markers+text",
             name="Big swing",
@@ -186,29 +212,25 @@ def plot_momentum(df, top_swings, home_name="Home", away_name="Away"):
             text=top_swings["swing"].apply(lambda s: f"+{int(s)}"),
             textposition="top center",
             hovertemplate=(
-                "Play %{x}<br>"
+                "%{customdata[0]}<br>"
                 "Differential: %{y}<br>"
-                "Swing: %{customdata}<br>"
+                "Swing: %{customdata[1]}<br>"
                 "<extra></extra>"
             ),
-            customdata=top_swings["text"],
+            customdata=top_swings[["timeLabel", "text"]],
         ))
 
 # --- Quarter / OT divider lines along the game-minute scale ---
-    for boundary in (12, 24, 36):
-        fig.add_vline(x=boundary, line_dash="dot",
-                      line_color="rgba(0,0,0,0.18)", line_width=1)
-    for label, x_pos in (("Q1", 6), ("Q2", 18), ("Q3", 30), ("Q4", 42)):
-        fig.add_annotation(x=x_pos, y=1, yref="paper", text=label,
-                           showarrow=False,
-                           font=dict(size=11, color="rgba(0,0,0,0.45)"))
+    add_period_markers(fig, df["gameMinutes"].max())
+
 
     fig.update_layout(
         title=f"NBA Game Visualizer — {home_name} vs {away_name}",
-        xaxis_title="Play number",
+        xaxis_title="Game Minutes",
         yaxis_title="Score differential (home − away)",
         template="plotly_white",
         hovermode="x unified",
+        xaxis=dict(dtick=6,range=[0, max(48, df["gameMinutes"].max())]),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
 
