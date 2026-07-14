@@ -1,13 +1,12 @@
 # NBA Game Visualizer - Version 1
 # --------------------------------
-# Set GAME_ID below, run program, get summary and an interactive Plotly momentum chart in browser.
-
+# Pick a team and game and get a summary and interactive Plotly chart of the game's momentum swings.
 import requests
 import pandas as pd
 import plotly.graph_objects as go
 import os
 
-GAME_ID = "401585723"  #Placeholder for now, will update so the user can choose
+BASE_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
 
 # Path to  CSV 
 DATA_DIR = "data"
@@ -16,8 +15,7 @@ OUTPUT_HTML = "output.html"
 # Fetch JSON from ESPN's play-by-play endpoint
 def fetch_game_data(game_id):
     url = (
-        f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
-        f"summary?event={game_id}"
+        f"{BASE_URL}/summary?event={game_id}"
     )
     try:
         response = requests.get(url)
@@ -186,10 +184,11 @@ def plot_momentum(df, top_swings, home_name="Home", away_name="Away"):
         line=dict(color="#1d428a", width=2),   # NBA blue
         hovertemplate=(
             "%{customdata[0]}<br>"
+            f"{home_name} %{{customdata[2]:.0f}} — {away_name} %{{customdata[3]:.0f}}<br>"
             "Differential: %{y}<br>"
             "%{customdata[1]}<extra></extra>"
         ),
-        customdata=df[["timeLabel", "text"]],
+        customdata=df[["timeLabel", "text", "homeScore", "awayScore"]],
     ))
 
     # --- Horizontal zero line (tied game) ---
@@ -213,11 +212,11 @@ def plot_momentum(df, top_swings, home_name="Home", away_name="Away"):
             textposition="top center",
             hovertemplate=(
                 "%{customdata[0]}<br>"
+                f"{home_name} %{{customdata[2]:.0f}} - {away_name} %{{customdata[3]:.0f}}<br>"
                 "Differential: %{y}<br>"
-                "Swing: %{customdata[1]}<br>"
-                "<extra></extra>"
+                "%{customdata[1]}<extra></extra>"
             ),
-            customdata=top_swings[["timeLabel", "text"]],
+            customdata=top_swings[["timeLabel", "text", "homeScore", "awayScore"]],
         ))
 
 # --- Quarter / OT divider lines along the game-minute scale ---
@@ -242,10 +241,148 @@ def save_csv(df, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     df.to_csv(path, index=False)
 
+# Fetch all 30 NBA teams (one small request)
+def fetch_teams():
+    url = f"{BASE_URL}/teams?limit=32"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] Could not fetch team list: {e}")
+        raise SystemExit(1)
+
+    data = response.json()
+    teams = []
+    try:
+        team_items = data["sports"][0]["leagues"][0]["teams"]
+    except (KeyError, IndexError):
+        print("[ERROR] Unexpected team list format from ESPN.")
+        raise SystemExit(1)
+
+    for item in team_items:
+        t = item.get("team", {})
+        teams.append({
+            "id":   t.get("id", ""),
+            "name": t.get("displayName", "Unknown"),
+            "abbr": t.get("abbreviation", ""),
+        })
+
+    return sorted(teams, key=lambda t: t["name"])
+
+# Pick a team by number OR by typing part of a name/abbreviation
+def choose_team():
+    teams = fetch_teams()
+
+    print("\nNBA Teams:")
+    for i, t in enumerate(teams, 1):
+        print(f"  {i:2d}. {t['abbr']:4s} {t['name']}")
+
+    while True:
+        raw = input("\nPick a team (number, or type a name/abbreviation): ").strip()
+        if not raw:
+            continue
+
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(teams):
+                return teams[idx - 1]
+            print(f"Please enter a number between 1 and {len(teams)}.")
+            continue
+
+        query = raw.lower()
+        matches = [t for t in teams
+                   if query in t["name"].lower() or query == t["abbr"].lower()]
+
+        if len(matches) == 1:
+            return matches[0]
+        elif len(matches) > 1:
+            print("Multiple matches, be more specific:")
+            for t in matches:
+                print(f"  - {t['name']} ({t['abbr']})")
+        else:
+            print("No team matched that. Try again.")
+
+# Fetch a team's schedule, keep only completed games
+def fetch_completed_games(team_id, season=None):
+    url = f"{BASE_URL}/teams/{team_id}/schedule"
+    if season:
+        url += f"?season={season}"
+
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] Could not fetch schedule: {e}")
+        raise SystemExit(1)
+
+    events = response.json().get("events", [])
+    games = []
+
+    for event in events:
+        comp = event.get("competitions", [{}])[0]
+        status = comp.get("status", {}).get("type", {})
+        if not status.get("completed", False):
+            continue   # skip unplayed games
+
+        score_bits = []
+        for c in comp.get("competitors", []):
+            abbr = c.get("team", {}).get("abbreviation", "?")
+            score = c.get("score", {})
+            # schedule endpoint returns score as a dict, summary as a string
+            score_val = score.get("displayValue", "?") if isinstance(score, dict) else score
+            score_bits.append(f"{abbr} {score_val}")
+
+        games.append({
+            "id":    event.get("id", ""),
+            "date":  event.get("date", "")[:10],
+            "name":  event.get("shortName", event.get("name", "Unknown matchup")),
+            "score": " — ".join(score_bits),
+        })
+
+    games.sort(key=lambda g: g["date"], reverse=True)
+    return games
+
+# Show recent games 10 at a time and let the user pick one
+def choose_game(team, games_per_page=10):
+    season = input(f"\nSeason year for {team['name']} (Enter for current, e.g. 2026 = the 2025-26 season): ").strip()
+    games = fetch_completed_games(team["id"], season or None)
+
+    if not games:
+        print("No completed games found. Try another season year.")
+        return None
+
+    page = 0
+    while True:
+        start = page * games_per_page
+        chunk = games[start:start + games_per_page]
+        if not chunk:
+            print("No more games.")
+            page = 0
+            continue
+
+        print(f"\nRecent games for {team['name']} ({start + 1}–{start + len(chunk)} of {len(games)}):")
+        for i, g in enumerate(chunk, start + 1):
+            print(f"  {i:2d}. {g['date']}  {g['name']:12s} {g['score']}")
+
+        raw = input("\nPick a game number ('m' for more, 'b' to go back): ").strip().lower()
+        if raw == "m":
+            page += 1
+        elif raw == "b":
+            page = max(0, page - 1)
+        elif raw.isdigit() and 1 <= int(raw) <= len(games):
+            return games[int(raw) - 1]
+        else:
+            print("Invalid choice.")
 
 
 def main():
-    raw = fetch_game_data(GAME_ID)
+    team = choose_team()
+    game_choice = choose_game(team)
+    if game_choice is None:
+        raise SystemExit(0)
+    game_id = game_choice["id"]
+
+    raw = fetch_game_data(game_id)
     header = raw.get("header", {})
     plays_raw = raw.get("plays", [])
     team_map = build_team_map(header)
@@ -272,7 +409,7 @@ def main():
     final_home = int(df["homeScore"].iloc[-1]) if not df.empty else "?"
     final_away = int(df["awayScore"].iloc[-1]) if not df.empty else "?"
     print("\n" + "=" * 50)
-    print(f"  Game ID   : {GAME_ID}")
+    print(f"  Game ID   : {game_id}")
     print(f"  {home_name} (home) vs {away_name} (away)")
     print(f"  Final score: {home_name} {final_home} – {away_name} {final_away}")
     print(f"  Total plays: {len(df)}")
@@ -285,7 +422,7 @@ def main():
         print(f"  {i}. [{row['team']}] {row['text'][:80]}  (swing: +{swing_val})")
     print()
 
-    csv_path = os.path.join(DATA_DIR, f"play_by_play_{GAME_ID}.csv")
+    csv_path = os.path.join(DATA_DIR, f"play_by_play_{game_id}.csv")
     save_csv(df, csv_path)
 
     # Build chart and open in browser
